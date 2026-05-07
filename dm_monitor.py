@@ -1,15 +1,7 @@
 """
 Instagram DM Response Monitor
-Checks Instagram inbox for replies from PT contacts who were DM'd via Phase 2F.
-Sends Slack alert and tags contact ig-dm-replied in GHL.
-
-Setup:
-    pip install -r requirements.txt
-    cp .env.example .env   # fill in your values
-    python dm_monitor.py
-
-Schedule every 4 hours via cron:
-    0 */4 * * * cd /path/to/ig-dm-monitor && python dm_monitor.py >> monitor.log 2>&1
+Uses direct HTTP requests with Instagram cookies — no instagrapi.
+Checks inbox for replies from PT contacts, alerts Slack, tags GHL.
 """
 
 import json
@@ -20,17 +12,45 @@ import requests
 from datetime import datetime
 from urllib.parse import unquote
 from dotenv import load_dotenv
-from instagrapi import Client
 
 load_dotenv()
 
-# ── Config ────────────────────────────────────────────────────────────────────
-IG_SESSION_ID   = os.environ["IG_SESSION_ID"]
+IG_COOKIES_RAW  = os.environ["IG_COOKIES"]
 GHL_API_TOKEN   = os.environ["GHL_API_TOKEN"]
 SLACK_WEBHOOK   = os.environ["SLACK_WEBHOOK"]
 GHL_LOCATION_ID = os.environ.get("GHL_LOCATION_ID", "KM3KkAQFgG3bByTZmWLL")
 SEEN_FILE       = os.path.join(os.path.dirname(__file__), "seen_dm_messages.json")
-# ─────────────────────────────────────────────────────────────────────────────
+
+
+def build_ig_session():
+    cookie_list = json.loads(IG_COOKIES_RAW)
+    cookies = {c["name"]: unquote(c["value"]) for c in cookie_list}
+    session = requests.Session()
+    for name, value in cookies.items():
+        session.cookies.set(name, value, domain=".instagram.com")
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "X-IG-App-ID": "936619743392459",
+        "X-CSRFToken": cookies.get("csrftoken", ""),
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://www.instagram.com/",
+        "Accept": "*/*",
+    })
+    return session, cookies.get("ds_user_id", "")
+
+
+def get_inbox(session):
+    try:
+        res = session.get(
+            "https://www.instagram.com/api/v1/direct_v2/inbox/",
+            params={"limit": 20, "thread_message_limit": 10},
+            timeout=15,
+        )
+        data = res.json()
+        return data.get("inbox", {}).get("threads", [])
+    except Exception as e:
+        print("Inbox error:", e)
+        return []
 
 
 def load_seen():
@@ -46,7 +66,6 @@ def save_seen(seen):
 
 
 def get_watchlist():
-    """Return {instagram_username: ghl_contact} for contacts with ig-dm-sent but not ig-dm-replied."""
     headers = {
         "Authorization": "Bearer " + GHL_API_TOKEN,
         "Content-Type": "application/json",
@@ -82,9 +101,7 @@ def get_watchlist():
 
 def tag_replied_in_ghl(contact):
     today = datetime.now().strftime("%Y-%m-%d")
-    tags = list(contact.get("tags", []))
-    tags.append("ig-dm-replied")
-    tags.append("dm-replied-date:" + today)
+    tags = list(contact.get("tags", [])) + ["ig-dm-replied", "dm-replied-date:" + today]
     headers = {
         "Authorization": "Bearer " + GHL_API_TOKEN,
         "Content-Type": "application/json",
@@ -122,30 +139,25 @@ def main():
     if not watchlist:
         print("No contacts to watch")
         return
-
     print("Watching", len(watchlist), "contacts:", ", ".join(watchlist.keys()))
 
-    cl = Client()
-    try:
-        cl.login_by_sessionid(unquote(IG_SESSION_ID))
-        print("Instagram login OK, user_id:", cl.user_id)
-    except Exception as e:
-        print("Instagram login failed:", e)
+    session, my_user_id = build_ig_session()
+    threads = get_inbox(session)
+
+    if not threads:
+        print("No inbox threads returned - session may be expired or blocked")
         sys.exit(1)
+
+    print("Inbox threads fetched:", len(threads))
 
     seen = load_seen()
     new_seen = dict(seen)
     alerts_sent = 0
 
-    try:
-        threads = cl.direct_threads(amount=50)
-    except Exception as e:
-        print("Failed to fetch inbox:", e)
-        sys.exit(1)
-
     for thread in threads:
-        for user in thread.users:
-            username = user.username.lower()
+        users = thread.get("users", [])
+        for user in users:
+            username = (user.get("username") or "").lower()
             if username not in watchlist:
                 continue
 
@@ -154,23 +166,19 @@ def main():
                 (contact.get("firstName") or "") + " " + (contact.get("lastName") or "")
             ).strip()
 
-            try:
-                messages = cl.direct_messages(thread.id, amount=20)
-            except Exception:
-                messages = thread.messages or []
-
+            messages = thread.get("items", [])
             for msg in messages:
-                msg_id = str(msg.id)
-                if msg_id in seen:
+                msg_id = str(msg.get("item_id", ""))
+                if not msg_id or msg_id in seen:
                     continue
                 new_seen[msg_id] = True
 
-                if str(msg.user_id) == str(cl.user_id):
+                sender_id = str(msg.get("user_id", ""))
+                if sender_id == my_user_id:
                     continue
 
-                msg_text = getattr(msg, "text", None) or "[non-text message]"
+                msg_text = msg.get("text", "") or "[non-text message]"
                 print("New reply from @" + username + ":", msg_text[:80])
-
                 notify_slack(username, contact_name, msg_text)
                 tag_replied_in_ghl(contact)
                 alerts_sent += 1
