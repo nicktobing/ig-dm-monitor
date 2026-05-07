@@ -18,6 +18,7 @@ import re
 import sys
 import requests
 from datetime import datetime
+from urllib.parse import unquote
 from dotenv import load_dotenv
 from instagrapi import Client
 
@@ -126,7 +127,7 @@ def main():
 
     cl = Client()
     try:
-        cl.login_by_sessionid(IG_SESSION_ID)
+        cl.login_by_sessionid(unquote(IG_SESSION_ID))
         print("Instagram login OK, user_id:", cl.user_id)
     except Exception as e:
         print("Instagram login failed:", e)
